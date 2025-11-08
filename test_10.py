@@ -234,8 +234,19 @@ def main():
     """
     
     # 指定地圖檔案路徑 (從 test4 複製)
+    
+    # --- [最終修復] ---
+    # 不使用 os.getcwd()，因為它不可靠 (取決於從哪裡執行腳本)
+    # 我們改用 __file__ 來取得 test_10.py 檔案的 "絕對目錄"
+    # 這樣無論您從哪個資料夾執行，路徑都是 100% 正確的
+    
+    # 取得 test_10.py 檔案所在的目錄
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    
     # [重要] 確保這個路徑是正確的！
-    map_file_path = os.path.join(os.getcwd(), 'data', 'DungeonMaps', 'test', 'img_6032b.png')
+    # (從 script_dir (即 ncm_dungeon-main) 開始往下找)
+    map_file_path = os.path.join(script_dir, 'data', 'DungeonMaps', 'test', 'img_6032b.png')
+    # --- [修復結束] ---
     
     # 檢查地圖檔案是否存在 (從 test4 複製)
     if not os.path.exists(map_file_path):

@@ -63,9 +63,9 @@ class Robot:
             base_dir = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))
             
             if self.mode:
-                self.map_dir = os.path.join(base_dir, 'robot_rl/data', 'DungeonMaps', 'train')
+                self.map_dir = os.path.join(base_dir, 'ncmapping/data', 'DungeonMaps', 'train')
             else:
-                self.map_dir = os.path.join(base_dir, 'robot_rl/data', 'DungeonMaps', 'test')
+                self.map_dir = os.path.join(base_dir, 'ncmapping/data', 'DungeonMaps', 'test')
                 
             os.makedirs(self.map_dir, exist_ok=True)
             

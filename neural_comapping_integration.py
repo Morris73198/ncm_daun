@@ -258,21 +258,32 @@ def create_robots_with_custom_positions(map_file_path, robot1_pos=None, robot2_p
                 robot2_pos[1] = np.clip(robot2_pos[1], 0, map_height-1)
                 
                 if global_map[robot1_pos[1], robot1_pos[0]] == 1:
-                    print("警告: 機器人1的指定位置是障礙物，將移至最近的自由空間")
+                    print("警告: 機器人1的指定位置是障礙物，將移至 ближайшие 自由空間")
                     robot1_pos = robot1.nearest_free(robot1.free_tree, robot1_pos)
                     
                 if global_map[robot2_pos[1], robot2_pos[0]] == 1:
-                    print("警告: 機器人2的指定位置是障礙物，將移至最近的自由空間")
+                    print("警告: 機器人2的指定位置是障礙物，將移至 ближайшие 自由空間")
                     robot2_pos = robot1.nearest_free(robot1.free_tree, robot2_pos)
                 
                 robot1.robot_position = robot1_pos
                 robot1.other_robot_position = robot2_pos
+
+                # --- [所有修補程式 (v5) 已移除] ---
+                # 我們不再需要儲存 'custom_start_pos'
+                
             else:
                 robot1.robot_position = initial_positions[0].astype(np.int64)
                 robot1.other_robot_position = initial_positions[1].astype(np.int64)
+                
+                # --- [所有修補程式 (v5) 已移除] ---
+                # 我們不再需要儲存 'custom_start_pos'
             
             robot1.op_map = np.ones(global_map.shape) * 127
             robot1.map_size = np.shape(global_map)
+            
+            # --- [所有修補程式 (v5) 已移除] ---
+            # 我們不再需要「劫持」map_dir 或 initial_positions，
+            # 因為我們不再呼叫 reset()。
             
             robot2 = cls(0, train, plot, is_primary=False, shared_env=robot1)
             
@@ -337,8 +348,16 @@ def run_episode_with_neural_comapping(robot1_wrapper, robot2_wrapper, tracker, m
     - [修改] 計算並返回完整的 coverage_data (R1, R2, Inter, Union)
     - [修復] 同步 other_robot_position
     """
-    robot1_wrapper.robot.reset()
-    robot2_wrapper.robot.reset()
+    
+    # --- [最終修復：模仿 test_4.py] ---
+    # 不再呼叫 reset()，改為呼叫 begin()
+    # begin() 會在 *正確的* 自訂起始點初始化感測器
+    robot1_wrapper.robot.begin()
+    robot2_wrapper.robot.begin()
+    
+    # --- [v5 修補程式已移除] ---
+    # 我們不再需要 'custom_start_pos' 修補程式，
+    # 因為 begin() 已經在正確的位置初始化了
     
     done1 = done2 = False
     steps = 0
@@ -350,12 +369,21 @@ def run_episode_with_neural_comapping(robot1_wrapper, robot2_wrapper, tracker, m
     
     tracker.start_tracking()
     
+    # --- [v5 邏輯保留] ---
+    # 邏輯與 test_4.py 相同：
+    # 在開始迴圈 *之前*，先 update() 和 save_plot() 
+    
+    # 1. 在新位置掃描感測器
+    tracker.update()
+    
     if output_dir:
+        # 2. 繪製 step 0 的狀態 (現在感測器是正確的)
         save_plot(robot1_wrapper.robot, 0, os.path.join(output_dir, 'robot1_step_0000.png'))
         save_plot(robot2_wrapper.robot, 0, os.path.join(output_dir, 'robot2_step_0000.png'))
     
-    tracker.update() 
+    # 3. 儲存地圖
     tracker.save_current_maps(0)
+    # --- [邏輯保留結束] ---
 
     total_explorable = np.sum(robot1_wrapper.robot.global_map == 255)
     
