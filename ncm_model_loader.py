@@ -1,221 +1,289 @@
-"""
-完整的NeuralCoMapping模型載入器
-兼容原始checkpoint的架構
-"""
-
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import add_self_loops, degree
 import numpy as np
+from collections import OrderedDict
+
+#
+# --------------------------------------------------------------------------------
+# (架構定義) 
+# --------------------------------------------------------------------------------
+#
+
+class GNN_Layer(MessagePassing):
+    """
+    GNN Layer (Message Passing) - 匹配 siyandong/neuralcomapping/utils/gnn.py
+    """
+    def __init__(self, in_dim, out_dim, args, aggr='add'):
+        super(GNN_Layer, self).__init__(aggr=aggr)
+        self.args = args
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+
+        self.attn_merge = nn.Linear(2 * in_dim + args['f_dim'], in_dim)
+        self.attn_proj = nn.Linear(in_dim, 1, bias=False)
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, out_dim),
+            nn.LeakyReLU(negative_slope=0.2),
+            nn.Linear(out_dim, out_dim)
+        )
+        
+        self.activation = nn.LeakyReLU(negative_slope=0.2)
+        
+        nn.init.xavier_uniform_(self.attn_merge.weight)
+        nn.init.xavier_uniform_(self.attn_proj.weight)
+
+    def forward(self, x, edge_index, edge_attr):
+        num_nodes = x.size(0)
+        edge_attr = edge_attr.unsqueeze(-1) if edge_attr.dim() == 1 else edge_attr
+
+        #
+        # [ 錯誤 2 修正 ] 
+        # ------------------------------------------------------------------------
+        # torch_geometric 1.6.3 的 add_self_loops 不支援 2D 的 edge_attr。
+        # 我們必須手動處理：
+        
+        # 1. 僅為 edge_index 添加 self-loops
+        edge_index_with_loops, _ = add_self_loops(edge_index, num_nodes=num_nodes)
+        
+        # 2. 為新的 self-loops 創建對應的「填充」屬性 (N, 6)
+        #    (N = 節點數量, 6 = f_dim)
+        loop_attr = torch.zeros(num_nodes, self.args['f_dim'], device=edge_attr.device)
+        
+        # 3. 將原始的 edge_attr 和新的 loop_attr 結合起來
+        edge_attr_with_loops = torch.cat([edge_attr, loop_attr], dim=0)
+        # ------------------------------------------------------------------------
+        #
+        
+        row, col = edge_index_with_loops # [修正] 使用新的索引
+        x_i = x[row]
+        x_j = x[col]
+
+        # GNN (attention)
+        # [修正] 使用新的屬性張量
+        alpha_in = torch.cat([x_i, x_j, edge_attr_with_loops], dim=-1)
+        alpha_in = self.activation(self.attn_merge(alpha_in))
+        alpha = self.attn_proj(alpha_in)
+        
+        alpha = torch.exp(torch.clamp(alpha, -5, 5))
+        
+        # 訊息傳遞
+        out = self.propagate(edge_index_with_loops, x=x, alpha=alpha) # [修正] 使用新的索引
+        
+        # MLP (類似於原始 NCM 中的 FFN)
+        out = self.mlp(out)
+        return out
+
+    def message(self, x_j, alpha):
+        return x_j * alpha
 
 
-class AdaptedGNN(nn.Module):
+class GNN(nn.Module):
     """
-    適配的GNN - 可以載入NeuralCoMapping checkpoint
-    但輸入輸出接口與原代碼兼容
+    GNN (Multiple Layers) - 匹配 siyandong/neuralcomapping/utils/gnn.py
     """
-    def __init__(self):
-        super().__init__()
+    def __init__(self, args):
+        super(GNN, self).__init__()
+        self.args = args
+        self.n_layer = args['n_layer']
         
-        # 創建一個簡單的適配層
-        # 將我們的5維特徵映射到checkpoint需要的4維
-        self.feature_adapter = nn.Linear(5, 4, bias=False)
+        self.layers = nn.ModuleList()
+        for i in range(self.n_layer):
+            in_dim = self.args['g_h']
+            out_dim = self.args['g_h']
+            self.layers.append(GNN_Layer(in_dim, out_dim, args, aggr='add'))
         
-        # 初始化adapter為簡單的投影 (丟掉最後一維)
-        with torch.no_grad():
-            self.feature_adapter.weight.data = torch.eye(4, 5)
+        self.activation = nn.LeakyReLU(negative_slope=0.2)
         
-        # 預留空間給實際的GNN參數（將從checkpoint載入）
-        self.gnn_params = nn.ParameterDict()
+    def forward(self, x, edge_index, edge_attr):
+        x_ = x
+        for i in range(self.n_layer):
+            x_ = self.layers[i](x_, edge_index, edge_attr)
+            if i < self.n_layer - 1:
+                x_ = self.activation(x_)
+        return x_
+
+
+class NCM_Policy(nn.Module):
+    """
+    Neural CoMapping Policy - 匹配 siyandong/neuralcomapping/model.py 中的 'actor'
+    """
+    def __init__(self, args):
+        super(NCM_Policy, self).__init__()
+        self.args = args
+        self.n_agents = args['n_agents']
         
-    def forward(self, node_features, edge_features, edge_indices):
-        """
-        Args:
-            node_features: (num_nodes, 5) - 我們的特徵
-                [x_norm, y_norm, utility, dist_to_nearest_robot, exploration_gain]
-            edge_features: (num_edges, 3) - 不使用
-            edge_indices: (num_edges, 2) - 不使用
-        Returns:
-            affinity_matrix: (num_robots, num_frontiers)
-        """
-        num_nodes = node_features.shape[0]
-        num_robots = 2
-        num_frontiers = num_nodes - num_robots
+        self.agent_encoder = nn.Linear(args['f_dim'], args['g_h'])
+        self.frontier_encoder = nn.Linear(args['f_dim'], args['g_h'])
+
+        self.gnn = GNN(args)
+
+        self.affinity = nn.Linear(args['g_h'] * 2, 1)
+
+        self.activation = nn.LeakyReLU(negative_slope=0.2)
         
-        if num_frontiers <= 0:
-            return torch.zeros(num_robots, 0)
+        # 權重初始化 (可選，但有助於穩定)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x, edge_index, edge_attr):
+        x_agent = x[:self.n_agents]
+        x_frontier = x[self.n_agents:]
         
-        affinity = torch.zeros(num_robots, num_frontiers)
+        x_agent_ = self.activation(self.agent_encoder(x_agent))
+        x_frontier_ = self.activation(self.frontier_encoder(x_frontier))
+        x_ = torch.cat([x_agent_, x_frontier_], dim=0)
+
+        x_ = self.gnn(x_, edge_index, edge_attr)
         
-        # 提取特徵
-        robot_features = node_features[:num_robots]  # (2, 5)
-        frontier_features = node_features[num_robots:]  # (num_frontiers, 5)
+        x_agent_ = x_[:self.n_agents]
+        x_frontier_ = x_[self.n_agents:]
         
-        for r in range(num_robots):
-            robot_pos = robot_features[r, :2]  # 位置 (x, y)
-            
-            for f in range(num_frontiers):
-                frontier_pos = frontier_features[f, :2]  # 位置 (x, y)
-                frontier_utility = frontier_features[f, 2]  # utility
-                frontier_gain = frontier_features[f, 4]  # exploration_gain
-                
-                # 計算歐氏距離
-                dist = torch.norm(robot_pos - frontier_pos) + 1e-6
-                
-                # Affinity = 探索收益 / 距離
-                # 這與Hungarian算法的邏輯一致
-                gain = frontier_utility + frontier_gain + 1e-6
-                affinity[r, f] = gain / dist
+        n_frontiers = x_frontier_.size(0)
+        
+        x_agent_ = x_agent_.unsqueeze(1).repeat(1, n_frontiers, 1)
+        x_frontier_ = x_frontier_.unsqueeze(0).repeat(self.n_agents, 1, 1)
+        
+        affinity = torch.cat([x_agent_, x_frontier_], dim=2)
+        affinity = self.affinity(affinity).squeeze(2)
         
         return affinity
 
-
-def count_unknown_neighbors(x, y, op_map, radius=10):
-    """計算周圍未探索區域數量"""
-    h, w = op_map.shape
-    count = 0
-    total = 0
-    
-    for dx in range(-radius, radius+1):
-        for dy in range(-radius, radius+1):
-            nx, ny = int(x) + dx, int(y) + dy
-            if 0 <= nx < w and 0 <= ny < h:
-                total += 1
-                if op_map[ny, nx] == 127:  # 未探索區域
-                    count += 1
-    
-    return count / max(total, 1)
-
-
-def estimate_exploration_gain(x, y, op_map, radius=15):
-    """估計探索收益"""
-    h, w = op_map.shape
-    gain = 0
-    
-    for dx in range(-radius, radius+1):
-        for dy in range(-radius, radius+1):
-            nx, ny = int(x) + dx, int(y) + dy
-            if 0 <= nx < w and 0 <= ny < h:
-                if op_map[ny, nx] == 127:
-                    dist = np.sqrt(dx**2 + dy**2)
-                    gain += 1.0 / (1.0 + dist)
-    
-    return gain
-
-
+#
+# --------------------------------------------------------------------------------
+# (特徵提取)
+# --------------------------------------------------------------------------------
+#
 def extract_features(robots, frontiers, op_map):
     """
-    從環境中提取特徵用於GNN
-    
-    Args:
-        robots: List of robot positions [(x,y), ...]
-        frontiers: List of frontier positions [(x,y), ...]
-        op_map: Occupancy map
-        
-    Returns:
-        node_features: torch.FloatTensor (num_nodes, 5)
-        edge_features: torch.FloatTensor (num_edges, 3) - 用於兼容性，實際不使用
-        edge_indices: torch.LongTensor (num_edges, 2) - 用於兼容性，實際不使用
+    Extract node features, edge features, and edge indices for GNN
     """
-    num_robots = len(robots)
-    num_frontiers = len(frontiers)
+    n_agents = len(robots)
+    n_frontiers = len(frontiers)
     
-    if num_frontiers == 0:
-        # 處理沒有frontier的情況
-        node_features = torch.zeros((num_robots, 5))
-        edge_features = torch.zeros((0, 3))
-        edge_indices = torch.zeros((0, 2), dtype=torch.long)
-        return node_features, edge_features, edge_indices
+    # Node features: [x, y, op_map_val, is_agent, is_frontier, dist_to_nearest_agent]
+    nodes = []
     
-    # Node features: [x_norm, y_norm, utility, dist_to_nearest_robot, exploration_gain]
-    node_features = []
-    
-    map_h, map_w = op_map.shape
-    
-    # Robot nodes
-    for rx, ry in robots:
-        node_features.append([
-            rx / map_w,
-            ry / map_h,
-            0.0,  # robots沒有utility
-            0.0,  # 自己到自己距離為0
-            0.0   # robots不提供exploration gain
-        ])
-    
+    # Agent nodes
+    for i, (rx, ry) in enumerate(robots):
+        nodes.append([rx, ry, op_map[int(ry), int(rx)], 1, 0, 0])
+        
     # Frontier nodes
-    for fx, fy in frontiers:
-        # Utility: 周圍未探索區域數量
-        utility = count_unknown_neighbors(fx, fy, op_map)
+    for i, (fx, fy) in enumerate(frontiers):
+        dists = [np.linalg.norm(np.array(r) - np.array((fx, fy))) for r in robots]
+        nodes.append([fx, fy, op_map[int(fy), int(fx)], 0, 1, min(dists)])
         
-        # Distance to nearest robot
-        dists = [np.linalg.norm(np.array([fx, fy]) - np.array(r)) for r in robots]
-        min_dist = min(dists) / np.sqrt(map_w**2 + map_h**2)  # normalize
-        
-        # Exploration gain
-        exploration_gain = estimate_exploration_gain(fx, fy, op_map)
-        
-        node_features.append([
-            fx / map_w,
-            fy / map_h,
-            utility,
-            min_dist,
-            exploration_gain
-        ])
+    node_features = torch.FloatTensor(nodes)
     
-    node_features = torch.FloatTensor(node_features)
+    # Edge indices and features
+    edge_index = []
+    edge_attr = []
     
-    # Edge features - 創建但不使用（用於兼容性）
-    edge_features = torch.zeros((0, 3))
-    edge_indices = torch.zeros((0, 2), dtype=torch.long)
+    # f_dim = 6
+    # [dist, is_aa, is_af, 0, 0, 0]
     
-    return node_features, edge_features, edge_indices
+    # Agent <-> Agent
+    for i in range(n_agents):
+        for j in range(i + 1, n_agents):
+            edge_index.extend([[i, j], [j, i]])
+            dist = np.linalg.norm(np.array(robots[i]) - np.array(robots[j]))
+            edge_attr.extend([[dist, 1, 0, 0, 0, 0], [dist, 1, 0, 0, 0, 0]]) 
+
+    # Agent <-> Frontier
+    for i in range(n_agents):
+        for j in range(n_frontiers):
+            edge_index.extend([[i, n_agents + j], [n_agents + j, i]])
+            dist = np.linalg.norm(np.array(robots[i]) - np.array(frontiers[j]))
+            edge_attr.extend([[dist, 0, 1, 0, 0, 0], [dist, 0, 1, 0, 0, 0]])
+    
+    edge_index = torch.LongTensor(edge_index).t().contiguous()
+    edge_attr = torch.FloatTensor(edge_attr)
+    
+    if edge_index.shape[1] != edge_attr.shape[0]:
+        raise RuntimeError(f"特徵提取錯誤: 邊索引數量 ({edge_index.shape[1]}) "
+                         f"與邊屬性數量 ({edge_attr.shape[0]}) 不匹配!")
+
+    return node_features, edge_attr, edge_index
+
+#
+# --------------------------------------------------------------------------------
+# (權重載入)
+# --------------------------------------------------------------------------------
+#
+def load_pretrained_ncm(model_path=None):
+    """
+    [已修正] 載入預訓練的NCM模型
+    """
+    args = {
+        'n_agents': 2,
+        'f_dim': 6,       
+        'n_head': 1,
+        'n_layer': 3,
+        'dropout': 0.1,
+        'f_gh': 16,
+        'g_dim': 16,
+        'g_global_pool': 'max',
+        'g_h': 32,
+        'g_h_fc': 32
+    }
+    
+    model = NCM_Policy(args)
+    
+    if model_path is not None:
+        try:
+            checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
+            
+            source_state_dict = None
+            
+            # [ 錯誤 1 修正 ]
+            # 檢查 'network' 或 'model_state_dict' 
+            if isinstance(checkpoint, dict) and 'network' in checkpoint:
+                source_state_dict = checkpoint['network']
+                print(f"ℹ️ 找到權重於 'network' 鍵中...")
+            elif isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                source_state_dict = checkpoint['model_state_dict']
+                print(f"ℹ️ 找到權重於 'model_state_dict' 鍵中...")
+            elif isinstance(checkpoint, dict):
+                 # 如果是字典但沒有那兩個鍵, 可能是原始 state_dict
+                source_state_dict = checkpoint
+                print(f"ℹ️ (後備) 嘗試直接載入字典...")
+            else:
+                 raise ValueError("權重檔既不是字典也不是 state_dict。")
+            
+            # [ 錯誤 1 修正 ] 
+            # 建立一個新的 state_dict，並剝離 "actor." 字首
+            actor_state_dict = OrderedDict()
+            prefix = "actor."
+            
+            keys_matched = 0
+            for k, v in source_state_dict.items():
+                if k.startswith(prefix):
+                    name = k[len(prefix):] # 移除 "actor."
+                    actor_state_dict[name] = v
+                    keys_matched += 1
+            
+            if keys_matched == 0:
+                 print(f"!! 警告: 找不到 'actor.' 字首，嘗試直接載入。 (可能是規則版?)")
+                 # 如果沒有 'actor.' 字首 (例如您載入了一個非 NCM 的模型)，嘗試直接載入
+                 model.load_state_dict(source_state_dict, strict=False)
+                 print(f"✅ (後備) 成功載入 state_dict (無 'actor.' 字首): {model_path}")
+            else:
+                # 載入剝離後的權重
+                print(f"ℹ️ 成功剝離 {keys_matched} 個 'actor.' 權重...")
+                model.load_state_dict(actor_state_dict, strict=False) # strict=False 忽略不匹配的鍵
+                print(f"✅ 成功從字典載入NCM模型權重 (剝離 'actor.' 字首): {model_path}")
 
 
-def load_pretrained_ncm(model_path):
-    """
-    加載預訓練的NCM模型
-    
-    Args:
-        model_path: 預訓練模型路徑
-        
-    Returns:
-        model: 加載好的模型
-    """
-    model = AdaptedGNN()
-    
-    try:
-        print(f"🔍 正在載入checkpoint: {model_path}")
-        checkpoint = torch.load(model_path, map_location='cpu')
-        
-        if 'network' not in checkpoint:
-            print(f"⚠️  Checkpoint格式異常，使用隨機初始化")
-            model.eval()
-            return model
-        
-        network_state = checkpoint['network']
-        
-        # 嘗試載入actor中的關鍵參數
-        actor_params = {k.replace('actor.', ''): v for k, v in network_state.items() 
-                       if 'actor' in k}
-        
-        print(f"   找到 {len(actor_params)} 個actor參數")
-        
-        # 載入到gnn_params中保存（即使不直接使用）
-        for key, value in list(actor_params.items())[:10]:  # 只保存前10個作為示例
-            try:
-                param_name = key.replace('.', '_')[:50]  # 限制長度
-                model.gnn_params[param_name] = nn.Parameter(value, requires_grad=False)
-            except:
-                pass
-        
-        print(f"   ✅ 成功載入checkpoint結構")
-        print(f"   ℹ️  使用adapted GNN進行推理")
-        
-    except FileNotFoundError:
-        print(f"⚠️  找不到預訓練模型: {model_path}")
-        print("   使用隨機初始化的模型")
-    except Exception as e:
-        print(f"⚠️  加載模型時出錯: {e}")
-        print("   使用隨機初始化的模型")
+        except Exception as e:
+            print(f"❌ 載入NCM模型權重失敗: {e}")
+            print(f"!! 警告: 正在使用未經訓練的隨機權重 !!")
     
     model.eval()
     return model

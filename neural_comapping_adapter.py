@@ -56,9 +56,10 @@ class SimplifiedGraphMatcher:
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
         
         assignments = {}
+        # [修正] linear_sum_assignment 找到的就已是最佳解，
+        # 無論其q_value是正還是負，都應該被分配。
         for robot_idx, frontier_idx in zip(row_ind, col_ind):
-            if affinity_matrix[robot_idx, frontier_idx] > 0:
-                assignments[robot_idx] = frontier_idx
+            assignments[robot_idx] = frontier_idx
         
         return assignments
 
@@ -78,7 +79,7 @@ class NeuralGraphMatcher:
         )
         
         with torch.no_grad():
-            affinity = self.model(node_features, edge_features, edge_indices)
+            affinity = self.model(node_features, edge_indices, edge_features)
         
         return affinity.cpu().numpy()
     

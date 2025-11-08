@@ -9,22 +9,16 @@ from two_robot_dueling_dqn_attention.config import ROBOT_CONFIG
 
 
 class RobotWithNeuralCoMapping:
-    """
-    將NeuralCoMapping整合到現有Robot class的wrapper
-    只替換frontier selection部分,保留A*和其他模組
-    """
-    
     def __init__(self, original_robot, neural_planner):
-        """
-        Args:
-            original_robot: 你原本的Robot實例
-            neural_planner: NeuralCoMappingPlanner實例
-        """
         self.robot = original_robot
         self.planner = neural_planner
-        
-        # 記錄配對的另一個機器人(用於雙機器人系統)
         self.other_robot_wrapper = None
+        
+        # [新增] 儲存 NCM 分配的長期目標
+        self.current_global_goal = None
+        
+        # [新增] 全局規劃的頻率
+        self.replanning_frequency = 10  # 每 10 步重新指派一次
     
     def set_other_robot(self, other_wrapper):
         """設定另一個機器人的wrapper"""
@@ -32,112 +26,82 @@ class RobotWithNeuralCoMapping:
     
     def step_with_neural_planner(self):
         """
-        使用NeuralCoMapping選擇frontier,然後用A*規劃路徑
-        替代原本的DQN action selection
+        [全新修正] 實現真正的 NCM 分層規劃邏輯
         """
-        # 如果正在執行路徑,繼續執行
-        if (self.robot.is_moving_to_target and 
-            self.robot.current_path is not None and 
-            self.robot.current_path_index < self.robot.current_path.shape[1]):
-            return self._execute_movement_step()
         
-        # 路徑執行完畢或沒有路徑,重新規劃
-        # 1. 獲取frontiers
-        frontiers = self.robot.get_frontiers()
-        
-        if len(frontiers) == 0:
-            return None, True  # 沒有frontier,探索完成
-        
-        # 2. 準備兩個機器人的位置
-        robots = [
-            tuple(self.robot.robot_position),
-            tuple(self.robot.other_robot_position)
-        ]
-        
-        # 3. 使用NeuralCoMapping選擇frontier
-        assignments = self.planner.select_frontiers(
-            robots, 
-            frontiers, 
-            self.robot.op_map
-        )
-        
-        # 4. 獲取此機器人的目標frontier
-        robot_idx = 0 if self.robot.is_primary else 1
-        
-        if robot_idx not in assignments:
-            # 如果沒有分配給此機器人,選距離最近的
-            dists = np.linalg.norm(frontiers - self.robot.robot_position, axis=1)
-            target_frontier = frontiers[np.argmin(dists)]
-        else:
-            target_frontier = np.array(assignments[robot_idx])
+        # 檢查是否需要執行「全局規劃」(NCM 分配)
+        # 條件：計數器到期 OR 機器人沒有長期目標
+        if (self.robot.steps % self.replanning_frequency == 0) or (self.current_global_goal is None):
+            
+            # --- 1. 全局規劃器 (NCM) ---
+            frontiers = self.robot.get_frontiers()
+            
+            if len(frontiers) == 0:
+                return None, self.robot.check_done()
 
-        
-        # 5. 使用A*規劃到目標frontier的路徑
-        self.robot.current_target_frontier = target_frontier
-        
-        # 使用原有的A*路徑規劃 (使用astar_path而非astar)
-        if hasattr(self.robot, 'astar_path'):
-            # 如果有astar_path方法,使用它
-            path = self.robot.astar_path(
-                self.robot.op_map,
-                self.robot.robot_position.astype(np.int32),
-                target_frontier.astype(np.int32)
-            )
-        else:
-            # 否則使用astar
-            path = self.robot.astar(
-                self.robot.op_map,
-                self.robot.robot_position,
-                target_frontier
-            )
-        
-        if path is None:
-            self.robot.is_moving_to_target = False
-            return None, False
-        
-        # 檢查path長度
-        path_length = len(path) if isinstance(path, list) else (path.shape[1] if path.ndim == 2 else path.shape[0])
-        
-        if path_length <= 1:
-            # 路徑太短(只有起點),認為已經到達frontier
-            # 強制執行感測器掃描以更新地圖並移除這個frontier
-            self.robot.op_map = self.robot.inverse_sensor(
-                self.robot.robot_position,
-                self.robot.sensor_range,
-                self.robot.op_map,
-                self.robot.global_map
+            # [可選優化] 在這裡插入 DBSCAN 群集邏輯 (參考 siyandong/utils/map_manager.py)
+            # clustered_frontiers = run_dbscan(frontiers)
+            # ... 為了簡單起見，我們先使用原始 frontiers ...
+
+            robots = [
+                tuple(self.robot.robot_position),
+                tuple(self.robot.other_robot_position)
+            ]
+
+            assignments = self.planner.select_frontiers(
+                robots, 
+                frontiers, # 理想情況下應為 clustered_frontiers
+                self.robot.op_map
             )
             
-            # !!重要!! 同步地圖到另一個機器人
-            if hasattr(self.robot, 'shared_env') and self.robot.shared_env is not None:
-                self.robot.shared_env.op_map = self.robot.op_map
-            elif hasattr(self.robot, 'other_robot') and self.robot.other_robot is not None:
-                self.robot.other_robot.op_map = self.robot.op_map
+            robot_idx = 0 if self.robot.is_primary else 1
+            robot_name = "Robot1" if self.robot.is_primary else "Robot2" # Debug
             
-            self.robot.is_moving_to_target = False
-            
-            # 重新獲取frontiers看是否有新的
-            new_frontiers = self.robot.get_frontiers()
-            if len(new_frontiers) == 0:
-                return None, True
-            
-            return None, False
-        
-        # 6. 設置路徑並開始移動
-        if isinstance(path, np.ndarray):
-            if path.ndim == 1:
-                self.robot.current_path = path.reshape(2, -1)
-            elif path.shape[0] == 2:
-                self.robot.current_path = path
+            if robot_idx not in assignments:
+                print(f"[NCM DEBUG] {robot_name}: NCM 未分配, 啟動 [後援-最近點]")
+                dists = np.linalg.norm(frontiers - self.robot.robot_position, axis=1)
+                new_target = frontiers[np.argmin(dists)]
             else:
-                self.robot.current_path = path.T
-        else:
-            self.robot.current_path = np.array(path).T
+                print(f"[NCM DEBUG] {robot_name}: NCM 分配新目標")
+                new_target = np.array(assignments[robot_idx])
             
-        self.robot.current_path_index = 0
-        self.robot.is_moving_to_target = True
+            # [關鍵] 更新長期目標
+            self.current_global_goal = new_target
+            # 確保 robot 物件也更新它，這樣 move_to_frontier 才能正確規劃
+            self.robot.current_target_frontier = self.current_global_goal
+
+        # --- 2. 局部規劃器 (每一步都執行) ---
         
-        return self._execute_movement_step()
+        if self.current_global_goal is None:
+            # 即使 NCM 失敗了，也沒找到後援點 (例如地圖是空的)
+            return None, self.robot.check_done()
+
+        # [關鍵] 無論如何，都朝著「儲存的」長期目標移動一步
+        # move_to_frontier 內部會自己處理 A* 尋路
+        observation, reward, task_done = self.robot.move_to_frontier(self.current_global_goal)
+        
+        # 如果 move_to_frontier 說 "done" (表示它抵達了)，
+        # 我們就把長期目標設為 None，強制 NCM 在下一步重新規劃
+        if task_done:
+            self.current_global_goal = None
+
+        # 檢查 Episode 是否結束 (探索率是否達標)
+        episode_done = self.robot.check_done()
+        
+        # (地圖同步)
+        if hasattr(self.robot, 'shared_env') and self.robot.shared_env is not None:
+            self.robot.shared_env.op_map = self.robot.op_map
+        elif hasattr(self.robot, 'other_robot') and self.robot.other_robot is not None:
+            self.robot.other_robot.op_map = self.robot.op_map
+
+        # (更新步數和繪圖)
+        self.robot.steps += 1
+        if self.robot.plot and self.robot.steps % 5 == 0:
+            self.robot.plot_env()
+            import matplotlib.pyplot as plt
+            plt.pause(0.01)
+
+        return observation, episode_done
     
     def _execute_movement_step(self):
         """
@@ -249,7 +213,7 @@ def create_neural_comapping_robots(index_map=0, use_neural=False, model_path=Non
     """
     創建使用NeuralCoMapping的雙機器人系統
     """
-    from two_robot_dueling_dqn_attention.environment.multi_robot_no_unknown import Robot
+    from two_robot_dueling_dqn_attention.environment.multi_robot import Robot
     
     robot1, robot2 = Robot.create_shared_robots(
         index_map=index_map,
