@@ -5,6 +5,7 @@ Multi-Robot Environment with NeuralCoMapping Integration
 
 import numpy as np
 from neural_comapping_adapter import NeuralCoMappingPlanner
+from two_robot_dueling_dqn_attention.config import ROBOT_CONFIG
 
 
 class RobotWithNeuralCoMapping:
@@ -140,46 +141,99 @@ class RobotWithNeuralCoMapping:
     
     def _execute_movement_step(self):
         """
-        執行一步移動(使用原有的移動邏輯)
-        每次移動movement_step個單位
+        執行一步移動 (使用原有的移動邏輯)
+        !! 已修正為逐步移動 !!
         """
         if not self.robot.is_moving_to_target or self.robot.current_path is None:
-            return None, False
-        
-        if self.robot.current_path_index >= self.robot.current_path.shape[1]:
             self.robot.is_moving_to_target = False
             return None, False
         
-        movement_step = getattr(self.robot, 'movement_step', 5)
-        next_index = min(self.robot.current_path_index + movement_step, 
-                        self.robot.current_path.shape[1] - 1)
+        if self.robot.current_path_index >= self.robot.current_path.shape[1]:
+            # 路徑上的所有點都已訪問
+            self.robot.is_moving_to_target = False
+            
+            # 檢查是否真的到達最終目標
+            dist_to_target = np.linalg.norm(self.robot.robot_position - self.robot.current_target_frontier)
+            
+            # 從 config.py 獲取閾值 (如果不存在則默認為 10)
+            target_reach_threshold = ROBOT_CONFIG.get('target_reach_threshold', 10)
+
+            if dist_to_target < target_reach_threshold:
+                 # 真的到了，強制掃描一次以清除這個frontier
+                self.robot.op_map = self.robot.inverse_sensor(
+                    self.robot.robot_position, self.robot.sensor_range,
+                    self.robot.op_map, self.robot.global_map
+                )
+            
+            return None, False # 移動結束
+
+        # --- (從 multi_robot.py 複製並修改的 "正確" 邏輯) ---
         
-        next_point = self.robot.current_path[:, next_index]
+        # 1. 獲取路徑上的 *下一個* 檢查點
+        next_point = self.robot.current_path[:, self.robot.current_path_index]
         
-        # 移動機器人
-        self.robot.robot_position = next_point.astype(np.int64)
-        self.robot.current_path_index = next_index + 1
+        # 2. 計算朝向下一個檢查點的 *移動向量*
+        move_vector = next_point - self.robot.robot_position
+        dist = np.linalg.norm(move_vector)
         
-        # 更新地圖(使用原有的感測器模型)
+        # 3. 從 config.py 獲取步長 (如果不存在則默認為 2)
+        movement_step = ROBOT_CONFIG.get('movement_step', 2) 
+        
+        # 4. 確保最小移動 (如果離下一個檢查點太近，直接跳到下下個)
+        MIN_MOVEMENT = 1.0
+        if dist < MIN_MOVEMENT:
+            self.robot.current_path_index += 1
+            # 只是推進了索引，還沒移動，所以回傳 False (未完成)
+            return self.robot.get_observation(), False 
+
+        # 5. 限制這一步的長度 (關鍵！)
+        if dist > movement_step:
+            move_vector = move_vector * (movement_step / dist)
+        
+        # 6. 執行這 "一小步" 移動
+        old_position = self.robot.robot_position.copy()
+        new_position = self.robot.robot_position + move_vector
+        self.robot.robot_position = np.round(new_position).astype(np.int64)
+        
+        # 7. 邊界檢查
+        self.robot.robot_position[0] = np.clip(self.robot.robot_position[0], 0, self.robot.map_size[1]-1)
+        self.robot.robot_position[1] = np.clip(self.robot.robot_position[1], 0, self.robot.map_size[0]-1)
+
+        # 8. 碰撞檢查 (使用觀測地圖 op_map)
+        #    (注意：原版 multi_robot.py 使用 global_map 檢查，這裡用 op_map 可能更合理)
+        if self.robot.op_map[self.robot.robot_position[1], self.robot.robot_position[0]] == 1:
+            self.robot.robot_position = old_position # 撤銷移動
+            self.robot.is_moving_to_target = False # 路徑被擋，停止
+            self.robot.current_path = None # 清除路徑，下次重新規劃
+            return self.robot.get_observation(), False # 沒完成，但路徑失敗
+
+        # 9. 更新地圖 (!! 修正：同時呼叫 robot_model 和 inverse_sensor !!)
         self.robot.op_map = self.robot.robot_model(
-            self.robot.robot_position,
-            self.robot.robot_size,
-            self.robot.t,
-            self.robot.op_map
+            self.robot.robot_position, self.robot.robot_size,
+            self.robot.t, self.robot.op_map
+        )
+        self.robot.op_map = self.robot.inverse_sensor(
+            self.robot.robot_position, self.robot.sensor_range,
+            self.robot.op_map, self.robot.global_map
         )
         
-        # !!重要!! 同步地圖到另一個機器人
+        # 10. (地圖同步)
         if hasattr(self.robot, 'shared_env') and self.robot.shared_env is not None:
             self.robot.shared_env.op_map = self.robot.op_map
         elif hasattr(self.robot, 'other_robot') and self.robot.other_robot is not None:
             self.robot.other_robot.op_map = self.robot.op_map
         
-        # 記錄軌跡
+        # 11. (記錄軌跡)
         self.robot.xPoint = np.append(self.robot.xPoint, self.robot.robot_position[0])
         self.robot.yPoint = np.append(self.robot.yPoint, self.robot.robot_position[1])
         
+        # 12. 只有當離下一個檢查點足夠近時，才推進 path_index
+        target_reach_threshold = ROBOT_CONFIG.get('target_reach_threshold', 10)
+        if dist < target_reach_threshold or dist < movement_step:
+             self.robot.current_path_index += 1
+
+        # 13. (更新步數和繪圖)
         self.robot.steps += 1
-        
         done = self.robot.check_done()
         observation = self.robot.get_observation()
         
