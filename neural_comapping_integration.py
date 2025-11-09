@@ -10,6 +10,7 @@ Multi-Robot Environment with NeuralCoMapping Integration
 - [修改] run_episode_with_neural_comapping 現在收集完整的 R1, R2, Intersection, Union 覆蓋率
 - [修復] run_episode_with_neural_comapping 同步 other_robot_position 以修正繪圖
 - [修復] create_robots_with_custom_positions 恢復使用 index_map=0 (這才是 test4 的原始邏輯)
+- [新增] 智能過濾：空閒機器人在分配前過濾掉忙碌機器人目標附近的點
 """
 
 import numpy as np
@@ -41,7 +42,7 @@ class RobotWithNeuralCoMapping:
         self.replanning_frequency = 10  # 每 10 步重新指派一次
         
         # [新增] 最小目標間距離（避免兩機器人選點太近）
-        self.min_target_separation = self.robot.sensor_range * 1.5  # 預設 75
+        self.min_target_separation = self.robot.sensor_range * 2.0  # 預設 100
     
     def set_other_robot(self, other_wrapper):
         """設定另一個機器人的wrapper"""
@@ -52,7 +53,7 @@ class RobotWithNeuralCoMapping:
         [新增] 過濾出範圍內的 frontiers
         """
         if max_range is None:
-            max_range = self.robot.sensor_range * 2
+            max_range = self.robot.sensor_range * 2000
         
         distances = np.linalg.norm(frontiers - self.robot.robot_position, axis=1)
         
@@ -61,6 +62,34 @@ class RobotWithNeuralCoMapping:
         out_range_frontiers = frontiers[~in_range_mask]
         
         return in_range_frontiers, out_range_frontiers
+    
+    def filter_frontiers_by_other_robot_target(self, frontiers):
+        """
+        [新增] 智能過濾：如果自己空閒而對方忙碌，過濾掉對方目標附近的點
+        """
+        if self.other_robot_wrapper is None:
+            return frontiers
+        
+        # 檢查對方機器人是否有目標
+        other_has_target = (self.other_robot_wrapper.current_global_goal is not None)
+        
+        if not other_has_target:
+            return frontiers
+        
+        # 對方有目標，計算距離
+        other_target = self.other_robot_wrapper.current_global_goal
+        distances_to_other_target = np.linalg.norm(
+            frontiers - other_target, axis=1
+        )
+        
+        # 過濾出距離足夠遠的點
+        valid_mask = distances_to_other_target >= self.min_target_separation
+        filtered_frontiers = frontiers[valid_mask]
+        
+        if len(filtered_frontiers) > 0:
+            return filtered_frontiers
+        else:
+            return frontiers
     
     def adjust_assignments_for_separation(self, assignments, frontiers_array, robots):
         """
@@ -115,6 +144,7 @@ class RobotWithNeuralCoMapping:
     def step_with_neural_planner(self):
         """
         [全新修正] 實現真正的 NCM 分層規劃邏輯
+        [新增] 智能過濾：空閒時先過濾掉對方目標附近的點
         """
         
         if (self.robot.steps % self.replanning_frequency == 0) or (self.current_global_goal is None):
@@ -137,6 +167,15 @@ class RobotWithNeuralCoMapping:
             else:
                 frontiers = all_frontiers
                 # print(f"[NCM RANGE] {robot_name}: 範圍內無 frontiers，使用全部 {len(all_frontiers)} 個")
+
+            # === 新增：智能過濾 ===
+            # 如果自己空閒（沒有目標），先過濾掉對方目標附近的點
+            if self.current_global_goal is None:
+                frontiers = self.filter_frontiers_by_other_robot_target(frontiers)
+                
+                if len(frontiers) == 0:
+                    return None, self.robot.check_done()
+            # ==========================================
 
             robots = [
                 tuple(self.robot.robot_position),
@@ -340,7 +379,7 @@ def create_neural_comapping_robots(map_file_path, robot1_pos, robot2_pos, use_ne
 
 
 # --- [重大修改] ---
-def run_episode_with_neural_comapping(robot1_wrapper, robot2_wrapper, tracker, max_steps=1000, output_dir=None):
+def run_episode_with_neural_comapping(robot1_wrapper, robot2_wrapper, tracker, max_steps=15000, output_dir=None):
     """
     [修改] 
     - 接受 tracker 參數

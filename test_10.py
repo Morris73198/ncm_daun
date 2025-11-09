@@ -86,7 +86,7 @@ def test_ncm_multiple_start_points(map_file_path, start_points_list, output_dir=
                 robot1_wrapper, 
                 robot2_wrapper, 
                 tracker, 
-                max_steps=1000,
+                max_steps=15000,
                 output_dir=current_output_dir
             )
             
@@ -245,7 +245,7 @@ def main():
     
     # [重要] 確保這個路徑是正確的！
     # (從 script_dir (即 ncm_dungeon-main) 開始往下找)
-    map_file_path = os.path.join(script_dir, 'data', 'DungeonMaps', 'test', 'img_6032b.png')
+    map_file_path = os.path.join(script_dir, 'data', 'DungeonMaps', 'test', 'img_6112b.png')
     # --- [修復結束] ---
     
     # 檢查地圖檔案是否存在 (從 test4 複製)
